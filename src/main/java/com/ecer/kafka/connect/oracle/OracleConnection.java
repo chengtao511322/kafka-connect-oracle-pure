@@ -11,6 +11,7 @@ import java.sql.SQLException;
 
 public class OracleConnection{
 
+
     public Connection connect(OracleSourceConnectorConfig config) throws SQLException{
         return DriverManager.getConnection(
             "jdbc:oracle:thin:@"+config.getDbHostName()+":"+config.getDbPort()+"/"+config.getDbName(),

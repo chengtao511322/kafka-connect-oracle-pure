@@ -27,12 +27,7 @@ import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.Timestamp;
-import java.util.ArrayList;
-import java.util.Arrays;
-import java.util.Collections;
-import java.util.HashMap;
-import java.util.List;
-import java.util.Map;
+import java.util.*;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
@@ -50,43 +45,57 @@ import org.slf4j.LoggerFactory;
 import net.sf.jsqlparser.JSQLParserException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.locks.LockSupport;
 
 /**
- *  
+ *
  * @author Erdem Cer (erdemcer@gmail.com)
  */
 
 public class OracleSourceTask extends SourceTask {
   static final Logger log = LoggerFactory.getLogger(OracleSourceTask.class);
-  private String dbName;  
+  private String dbName;
   private Long streamOffsetScn;
   private Long streamOffsetCommitScn;
-  private String streamOffsetRowId;  
+  private String streamOffsetRowId;
   private Long streamOffsetCtrl;
-  private String topic=null;  
+  private String topic=null;
   public OracleSourceConnectorConfig config;
   private OracleSourceConnectorUtils utils;
   private static Connection dbConn;
   String logMinerOptions=OracleConnectorSQL.LOGMINER_START_OPTIONS;
   String logMinerOptionsDeSupportCM=OracleConnectorSQL.LOGMINER_START_OPTIONS_DESUPPORT_CM;
   String logMinerStartScr=OracleConnectorSQL.START_LOGMINER_CMD;
+  String alterTimeDateFormat=OracleConnectorSQL.LOGMINER_DATEFORMAT;
   CallableStatement logMinerStartStmt=null;
   CallableStatement logMinerStopStmt = null;
   String logMinerSelectSql;
   static PreparedStatement logMinerSelect;
   PreparedStatement currentSCNStmt;
   ResultSet logMinerData;
-  ResultSet currentScnResultSet;  
+  ResultSet currentScnResultSet;
   private boolean closed=false;
   Boolean parseDmlData;
   static int ix=0;
   boolean skipRecord=true;
   private DataSchemaStruct dataSchemaStruct;
   Boolean oraDeSupportCM=false;
-  BlockingQueue<SourceRecord> sourceRecordMq = new LinkedBlockingQueue<>();    
+  BlockingQueue<SourceRecord> sourceRecordMq = new LinkedBlockingQueue<>();
   LogMinerThread tLogMiner;
   ExecutorService executor = Executors.newFixedThreadPool(1);
-   
+
+  //定义一个成功提交的时间
+  public static  Date commitDate;
+
+  //定义的超时时间大小
+  //public static Long maxTime = 5*1000*60L;//默认5分钟超时
+
+  //定义重启标识
+  private static Boolean restartFlag = false;
+
+  //下一次logminer的时间
+  private String nextStartLogminerTime;
+
   @Override
   public String version() {
     return VersionUtil.getVersion();
@@ -101,17 +110,17 @@ public class OracleSourceTask extends SourceTask {
     dbConn.close();
   }
 
-  
+
   @Override
   public void start(Map<String, String> map) {
     //TODO: Do things here that are required to start your task. This could be open a connection to a database, etc.
-    config=new OracleSourceConnectorConfig(map);    
+    config=new OracleSourceConnectorConfig(map);
     topic=config.getTopic();
     dbName=config.getDbNameAlias();
     parseDmlData=config.getParseDmlData();
     String startSCN = config.getStartScn();
     log.info("Oracle Kafka Connector is starting on {}",config.getDbNameAlias());
-    try {      
+    try {
       dbConn = new OracleConnection().connect(config);
       utils = new OracleSourceConnectorUtils(dbConn, config);
       int dbVersion = utils.getDbVersion();
@@ -124,8 +133,13 @@ public class OracleSourceTask extends SourceTask {
         oraDeSupportCM=true;
         logMinerSelectSql = utils.getLogMinerSelectSqlDeSupportCM();
       }
-      logMinerStartScr=logMinerStartScr+(oraDeSupportCM ? logMinerOptionsDeSupportCM : logMinerOptions)+") \n; end;";
-      //logMinerStartScr=logMinerStartScr+logMinerOptions+") \n; end;";
+
+      //修改logminer日期格式
+      CallableStatement callableStatement = dbConn.prepareCall(alterTimeDateFormat);
+      log.info(alterTimeDateFormat);
+      callableStatement.execute();
+      logMinerStartScr=logMinerStartScr+OracleConnectorSQL.START_LOGMINER_START_TIME+OracleConnectorSQL.START_LOGMINER_END_TIME+logMinerOptions+") \n; end;";
+      //logMinerStartScr=logMinerStartScr+(oraDeSupportCM ? logMinerOptionsDeSupportCM : logMinerOptions)+") \n; end;";
       logMinerStartStmt=dbConn.prepareCall(logMinerStartScr);
       Map<String,Object> offset = context.offsetStorageReader().offset(Collections.singletonMap(LOG_MINER_OFFSET_FIELD, dbName));
       streamOffsetScn=0L;
@@ -134,20 +148,20 @@ public class OracleSourceTask extends SourceTask {
       if (offset!=null){
         Object lastRecordedOffset = offset.get(POSITION_FIELD);
         Object commitScnPositionObject = offset.get(COMMITSCN_POSITION_FIELD);
-        Object rowIdPositionObject = offset.get(ROWID_POSITION_FIELD);        
+        Object rowIdPositionObject = offset.get(ROWID_POSITION_FIELD);
         streamOffsetScn = (lastRecordedOffset != null) ? Long.parseLong(String.valueOf(lastRecordedOffset)) : 0L;
         streamOffsetCommitScn = (commitScnPositionObject != null) ? Long.parseLong(String.valueOf(commitScnPositionObject)) : 0L;
         streamOffsetRowId = (rowIdPositionObject != null) ? (String) offset.get(ROWID_POSITION_FIELD) : "";
         if (oraDeSupportCM) streamOffsetScn = streamOffsetCommitScn;
-        log.info("Offset values , scn:{},commitscn:{},rowid:{}",streamOffsetScn,streamOffsetCommitScn,streamOffsetRowId);        
-      }      
+        log.info("Offset values , scn:{},commitscn:{},rowid:{}",streamOffsetScn,streamOffsetCommitScn,streamOffsetRowId);
+      }
 
       if (streamOffsetScn!=0L){
         if (!oraDeSupportCM){
           streamOffsetCtrl=streamOffsetScn;
           PreparedStatement lastScnFirstPosPs=dbConn.prepareCall(OracleConnectorSQL.LASTSCN_STARTPOS);
           lastScnFirstPosPs.setLong(1, streamOffsetScn);
-          lastScnFirstPosPs.setLong(2, streamOffsetScn);        
+          lastScnFirstPosPs.setLong(2, streamOffsetScn);
           ResultSet lastScnFirstPosRSet=lastScnFirstPosPs.executeQuery();
           while(lastScnFirstPosRSet.next()){
             streamOffsetScn= lastScnFirstPosRSet.getLong("FIRST_CHANGE#");
@@ -157,19 +171,19 @@ public class OracleSourceTask extends SourceTask {
           log.info("Captured last SCN has first position:{}",streamOffsetScn);
         }
       }
-      
+
       if (!startSCN.equals("")){
         log.info("Resetting offset with specified start SCN:{}",startSCN);
         streamOffsetScn=Long.parseLong(startSCN);
         //streamOffsetScn-=1;
         skipRecord=false;
       }
-      
+
       if (config.getResetOffset()){
         log.info("Resetting offset with new SCN");
         streamOffsetScn=0L;
         streamOffsetCommitScn=0L;
-        streamOffsetRowId="";        
+        streamOffsetRowId="";
       }
 
       if (streamOffsetScn==0L){
@@ -180,34 +194,82 @@ public class OracleSourceTask extends SourceTask {
           streamOffsetScn=currentScnResultSet.getLong("CURRENT_SCN");
         }
         currentScnResultSet.close();
-        currentSCNStmt.close();        
+        currentSCNStmt.close();
         log.info("Getting current scn from database {}",streamOffsetScn);
       }
       //streamOffsetScn+=1;
       log.info("Commit SCN : "+streamOffsetCommitScn);
       log.info(String.format("Log Miner will start at new position SCN : %s with fetch size : %s", streamOffsetScn,config.getDbFetchSize()));
       if (!oraDeSupportCM){
-      logMinerStartStmt.setLong(1, streamOffsetScn);
-      logMinerStartStmt.execute();      
-      logMinerSelect=dbConn.prepareCall(logMinerSelectSql);
-      logMinerSelect.setFetchSize(config.getDbFetchSize());
-      logMinerSelect.setLong(1, streamOffsetCommitScn);
-      logMinerData=logMinerSelect.executeQuery();
-      log.info("Logminer started successfully");
+        //logMinerStartStmt.setLong(1, streamOffsetScn);
+        log.info("logMinerStartScr:{}",logMinerStartScr);
+
+
+        //获取数据库当前时间
+        String currentDbTime = utils.getDbTime();
+        log.info("currentDbTime:{}",currentDbTime);
+        //获取配置文件配置的时间
+        String startTime = config.getStartTime();
+        log.info("读取到配置的startTime:{}",startTime);
+        //如果设定的是
+        if(TimeUtil.timeDifference(currentDbTime,startTime) > 10*1000){
+          log.info("本次logminer开始查询时间:{}",startTime);
+          String endTime = TimeUtil.timeIncrease(startTime, 5);
+          log.info("本次logminer结束查询时间......:{}",endTime);
+          //开启logminer视图,指定开始和结束时间
+          logMinerStartStmt.setString(1, startTime);
+          logMinerStartStmt.setString(2, endTime);
+          logMinerStartStmt.execute();
+          //指定下一次开始的时间
+          nextStartLogminerTime = endTime;
+        }
+
+
+        logMinerSelect=dbConn.prepareCall(logMinerSelectSql);
+        log.info("logMinerSelectSql:{}",logMinerSelectSql);
+        logMinerSelect.setFetchSize(config.getDbFetchSize());
+        logMinerData=logMinerSelect.executeQuery();
+        log.info("Logminer started successfully");
+        //开启线程轮训是否超时
+      /*new Thread(new Runnable() {
+        @Override
+        public void run() {
+          log.warn("开启线程监控查询状态.........");
+          while (true){
+            if(OracleSourceTask.commitDate == null){
+              continue;
+            }
+            //每10s轮询一次
+            try {
+              Thread.sleep(10*1000);
+              isOverTime();
+              //如果时间超时了,重启logminer的链接
+              if(restartFlag){
+                log.error("查询时间较长,关闭logminer并重启................");
+                restartLogminer();
+              }
+            } catch (InterruptedException e) {
+              e.printStackTrace();
+            }
+          }
+        }
+      }).start();*/
+
+
       }else{
-        //tLogMiner = new Thread(new LogMinerThread(sourceRecordMq,dbConn,streamOffsetScn, logMinerStartStmt,logMinerSelectSql,config.getDbFetchSize(),topic,dbName,utils));        
+        //tLogMiner = new Thread(new LogMinerThread(sourceRecordMq,dbConn,streamOffsetScn, logMinerStartStmt,logMinerSelectSql,config.getDbFetchSize(),topic,dbName,utils));
         tLogMiner = new LogMinerThread(sourceRecordMq,dbConn,streamOffsetScn, logMinerStartStmt,logMinerSelectSql,config.getDbFetchSize(),topic,dbName,utils);
         //tLogMiner.start();
         executor.submit(tLogMiner);
-        
+
         Runtime.getRuntime().addShutdownHook(new Thread(){
           @Override
           public void run(){
             tLogMiner.shutDown();
             executor.shutdown();
-            try {              
+            try {
               log.info("Waiting for logminer thread to shut down,exiting cleanly");
-              if (executor.awaitTermination(20000, TimeUnit.MILLISECONDS)) {                
+              if (executor.awaitTermination(20000, TimeUnit.MILLISECONDS)) {
               }
             } catch (Exception e) {
               log.error(e.getMessage());
@@ -218,15 +280,17 @@ public class OracleSourceTask extends SourceTask {
     }catch(SQLException e){
       throw new ConnectException("Error at database tier, Please check : "+e.toString());
     }
-  }    
+  }
 
   @Override
   public List<SourceRecord> poll() throws InterruptedException {
-    //TODO: Create SourceRecord objects that will be sent the kafka cluster. 
+    //TODO: Create SourceRecord objects that will be sent the kafka cluster.
     String sqlX="";
     try {
       ArrayList<SourceRecord> records = new ArrayList<>();
+      log.info("kafka开始发送数据................");
       if (!oraDeSupportCM){
+
         while(!this.closed && logMinerData.next()){
           if (log.isDebugEnabled()) {
             logRawMinerData();
@@ -245,10 +309,10 @@ public class OracleSourceTask extends SourceTask {
           //log.info("Data :"+scn+" Commit Scn :"+commitScn);
 
           ix++;
-      
+
           //String containerId = logMinerData.getString(SRC_CON_ID_FIELD);
           //log.info("logminer event from container {}", containerId);
-          String segOwner = logMinerData.getString(SEG_OWNER_FIELD); 
+          String segOwner = logMinerData.getString(SEG_OWNER_FIELD);
           String segName = logMinerData.getString(TABLE_NAME_FIELD);
           String sqlRedo = logMinerData.getString(SQL_REDO_FIELD);
           String operation = logMinerData.getString(OPERATION_FIELD);
@@ -258,37 +322,64 @@ public class OracleSourceTask extends SourceTask {
             logMinerData.next();
             sqlRedo +=  logMinerData.getString(SQL_REDO_FIELD);
             contSF = logMinerData.getBoolean(CSF_FIELD);
-          } 
-          sqlX=sqlRedo;        
+          }
+          sqlX=sqlRedo;
           Timestamp timeStamp=logMinerData.getTimestamp(TIMESTAMP_FIELD);
 
           Data row = new Data(scn, segOwner, segName, sqlRedo,timeStamp,operation);
           topic = config.getTopic().equals("") ? (config.getDbNameAlias()+DOT+row.getSegOwner()+DOT+(operation.equals(OPERATION_DDL) ? DDL_TOPIC_POSTFIX : segName)).toUpperCase() : topic;
           //log.info(String.format("Fetched %s rows from database %s ",ix,config.getDbNameAlias())+" "+row.getTimeStamp()+" "+row.getSegName()+" "+row.getScn()+" "+commitScn);
           if (ix % 100 == 0) log.info(String.format("Fetched %s rows from database %s ",ix,config.getDbNameAlias())+" "+row.getTimeStamp());
-          dataSchemaStruct = utils.createDataSchema(segOwner, segName, sqlRedo,operation); 
-          if (operation.equals(OPERATION_DDL)) row.setSegName(DDL_TOPIC_POSTFIX);     
+          dataSchemaStruct = utils.createDataSchema(segOwner, segName, sqlRedo,operation);
+          if (operation.equals(OPERATION_DDL)) row.setSegName(DDL_TOPIC_POSTFIX);
           /**
            * Issue 68
-           * 
+           *
            * Addition of DML types to target to allow only replication of certain DML operations.
            */
           if (
-        		  config.getDMLTypes() == null 
-        		  || config.getDMLTypes().equals("") 
-        		  || Arrays.asList(config.getDMLTypes().toUpperCase().split(",")).contains(operation)) {
-        	  records.add(new SourceRecord(sourcePartition(), sourceOffset(scn,commitScn,rowId), topic,  dataSchemaStruct.getDmlRowSchema(), setValueV2(row,dataSchemaStruct)));
-        	  streamOffsetScn=scn;        	  
-          }                          
+                  config.getDMLTypes() == null
+                          || config.getDMLTypes().equals("")
+                          || Arrays.asList(config.getDMLTypes().toUpperCase().split(",")).contains(operation)) {
+            records.add(new SourceRecord(sourcePartition(), sourceOffset(scn,commitScn,rowId), topic,  dataSchemaStruct.getDmlRowSchema(), setValueV2(row,dataSchemaStruct)));
+            streamOffsetScn=scn;
+          }
 
           return records;
         }
       }else{
-        
+
         records.add(sourceRecordMq.take());
         return records;
-      }      
-      log.info("Logminer stoppped successfully");       
+      }
+
+      //关闭视图
+      CallableStatement stopSt = dbConn.prepareCall(OracleConnectorSQL.STOP_LOGMINER_CMD);
+      stopSt.execute();
+      log.info("stop successful.......");
+      stopSt.close();
+
+      //获取数据库当前时间
+      String currentDbTime = utils.getDbTime();
+      String endTime = null;
+      //来到这里说明logminerData已经没有数据了,重开logminer
+      if(TimeUtil.timeDifference(currentDbTime,nextStartLogminerTime) > 5*1000){
+        endTime = TimeUtil.timeIncrease(nextStartLogminerTime, 5);
+      }else {
+        endTime = currentDbTime;
+      }
+
+
+      log.info("本次logminer开始查询时间:{}",nextStartLogminerTime);
+      log.info("新一轮的结束查询时间......:{}",endTime);
+      //开启logminer视图,指定开始和结束时间
+      logMinerStartStmt.setString(1, nextStartLogminerTime);
+      logMinerStartStmt.setString(2, endTime);
+      logMinerStartStmt.execute();
+      log.info("开启新一轮的查询,startTime:{},endTime:{}",nextStartLogminerTime,endTime);
+      nextStartLogminerTime=endTime;
+      logMinerData=logMinerSelect.executeQuery();
+      log.info("新视图开启成功..................");
     } catch (SQLException e){
       log.error("SQL error during poll",e );
     }catch(JSQLParserException e){
@@ -298,41 +389,96 @@ public class OracleSourceTask extends SourceTask {
       log.error("Error during poll on topic {} SQL :{}", topic, sqlX, e);
     }
     return null;
-    
+
   }
 
   @Override
   public void stop() {
     log.info("Stop called for logminer");
     this.closed=true;
-    try {            
+    try {
       log.info("Logminer session cancel");
       logMinerSelect.cancel();
       OracleSqlUtils.executeCallableStmt(dbConn, OracleConnectorSQL.STOP_LOGMINER_CMD);
       if (dbConn!=null){
-        log.info("Closing database connection.Last SCN : {}",streamOffsetScn);        
+        log.info("Closing database connection.Last SCN : {}",streamOffsetScn);
         logMinerSelect.close();
-        logMinerStartStmt.close();        
+        logMinerStartStmt.close();
         dbConn.close();
       }
     } catch (SQLException e) {log.error(e.getMessage());}
 
+  }
+
+  /**
+   * 重新开启logminer
+   */
+  public void reOpenLogminer(){
 
   }
 
-  private Struct setValueV2(Data row,DataSchemaStruct dataSchemaStruct) {    
+  /**
+   * 重启logminer
+   */
+  public void restartLogminer(){
+    log.info("Stop called for logminer.............");
+    this.closed=true;
+    try {
+      log.info("Logminer session cancel");
+      logMinerSelect.cancel();
+      OracleSqlUtils.executeCallableStmt(dbConn, OracleConnectorSQL.STOP_LOGMINER_CMD);
+      if (dbConn!=null){
+        log.info("Closing database connection.Last SCN : {}",streamOffsetScn);
+        logMinerSelect.close();
+        logMinerStartStmt.close();
+        dbConn.close();
+        //重新获取streamOffsetScn,和commitScn
+        Map<String,Object> offset = context.offsetStorageReader().offset(Collections.singletonMap(LOG_MINER_OFFSET_FIELD, dbName));
+        Long streamOffsetScnRestart =  Long.parseLong(String.valueOf(offset.get(POSITION_FIELD)));
+        log.info("重启logminer的scn位置:{}",streamOffsetScnRestart);
+
+        Long streamOffsetCommitScnRestart = Long.parseLong(String.valueOf(offset.get(COMMITSCN_POSITION_FIELD)));
+        log.info("重启logminer的commitscn位置:{}",streamOffsetCommitScnRestart);
+
+        //重新开启logminer
+        dbConn = new OracleConnection().connect(config);
+        utils = new OracleSourceConnectorUtils(dbConn, config);
+
+        log.info("重新链接到了数据库..........");
+        //开启logminer的sql
+        logMinerStartStmt=dbConn.prepareCall(logMinerStartScr);
+        logMinerStartStmt.setLong(1, streamOffsetScnRestart);
+        logMinerStartStmt.execute();
+
+        logMinerSelect=dbConn.prepareCall(logMinerSelectSql);
+        logMinerSelect.setFetchSize(1);
+        logMinerSelect.setLong(1, streamOffsetCommitScnRestart);
+        logMinerData=logMinerSelect.executeQuery();
+
+        this.closed=false;
+
+        log.info("Logminer 重启成功 ..Logminer restart successfully");
+        Thread.sleep(10);
+
+      }
+    } catch (SQLException e) {log.error(e.getMessage());} catch (InterruptedException e) {
+      e.printStackTrace();
+    }
+  }
+
+  private Struct setValueV2(Data row,DataSchemaStruct dataSchemaStruct) {
     Struct valueStruct = new Struct(dataSchemaStruct.getDmlRowSchema())
-              .put(SCN_FIELD, row.getScn())
-              .put(SEG_OWNER_FIELD, row.getSegOwner())
-              .put(TABLE_NAME_FIELD, row.getSegName())
-              .put(TIMESTAMP_FIELD, row.getTimeStamp())
-              .put(SQL_REDO_FIELD, row.getSqlRedo())
-              .put(OPERATION_FIELD, row.getOperation())
-              .put(DATA_ROW_FIELD, dataSchemaStruct.getDataStruct())
-              .put(BEFORE_DATA_ROW_FIELD, dataSchemaStruct.getBeforeDataStruct());
+            .put(SCN_FIELD, row.getScn())
+            .put(SEG_OWNER_FIELD, row.getSegOwner())
+            .put(TABLE_NAME_FIELD, row.getSegName())
+            .put(TIMESTAMP_FIELD, row.getTimeStamp())
+            .put(SQL_REDO_FIELD, row.getSqlRedo())
+            .put(OPERATION_FIELD, row.getOperation())
+            .put(DATA_ROW_FIELD, dataSchemaStruct.getDataStruct())
+            .put(BEFORE_DATA_ROW_FIELD, dataSchemaStruct.getBeforeDataStruct());
     return valueStruct;
-    
-  }  
+
+  }
 
   private Map<String,String> sourcePartition(){
     return Collections.singletonMap(LOG_MINER_OFFSET_FIELD, dbName);
@@ -348,14 +494,25 @@ public class OracleSourceTask extends SourceTask {
   }
 
   private void logRawMinerData() throws SQLException {
-	  if (log.isDebugEnabled()) {
-		  StringBuffer b = new StringBuffer();
-		  for (int i = 1; i < logMinerData.getMetaData().getColumnCount(); i++) {
-			  String columnName = logMinerData.getMetaData().getColumnName(i);
-			  Object columnValue = logMinerData.getObject(i);
-			  b.append("[" + columnName + "=" + (columnValue == null ? "NULL" : columnValue.toString()) + "]");
-		  }
-		  log.debug(b.toString());
-	  }
+    if (log.isDebugEnabled()) {
+      StringBuffer b = new StringBuffer();
+      for (int i = 1; i < logMinerData.getMetaData().getColumnCount(); i++) {
+        String columnName = logMinerData.getMetaData().getColumnName(i);
+        Object columnValue = logMinerData.getObject(i);
+        b.append("[" + columnName + "=" + (columnValue == null ? "NULL" : columnValue.toString()) + "]");
+      }
+      log.debug(b.toString());
+    }
   }
+
+  /**
+   * 当前时间减去最后一次提交时间是否超过指定时间
+   *
+   * @return
+   */
+  /*public void isOverTime(){
+    //当前时间
+    Date nowDate = new Date();
+    restartFlag = nowDate.getTime() - OracleSourceTask.commitDate.getTime() > maxTime;
+  }*/
 }

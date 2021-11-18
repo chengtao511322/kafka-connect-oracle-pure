@@ -27,12 +27,7 @@ import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.Timestamp;
-import java.util.ArrayList;
-import java.util.Arrays;
-import java.util.Collections;
-import java.util.HashMap;
-import java.util.List;
-import java.util.Map;
+import java.util.*;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
@@ -86,6 +81,11 @@ public class OracleSourceTask extends SourceTask {
   BlockingQueue<SourceRecord> sourceRecordMq = new LinkedBlockingQueue<>();    
   LogMinerThread tLogMiner;
   ExecutorService executor = Executors.newFixedThreadPool(1);
+  //定义静态时间变量为成功发送一条数据的时间点,先初始化
+  public static volatile Long nextTime = new Date().getTime();
+  private int timeOutMin;
+  private boolean restartLogminerFlag = false;
+  private Map<String, String> configMap = null;
    
   @Override
   public String version() {
@@ -105,13 +105,129 @@ public class OracleSourceTask extends SourceTask {
   @Override
   public void start(Map<String, String> map) {
     //TODO: Do things here that are required to start your task. This could be open a connection to a database, etc.
-    config=new OracleSourceConnectorConfig(map);    
+    configMap=map;
+    startLogminer(configMap);
+    new Thread(new Runnable() {
+      @Override
+      public void run() {
+        while (true){
+          try {
+            if(restartLogminerFlag){//如果重启则等待3m后再开始监测
+              log.info("监测线程等待3m重新开启logminer视图");
+              restart();
+              Thread.sleep(3*1000);
+            }
+            //每1m 监测一次
+            Thread.sleep(1000);
+          } catch (InterruptedException e) {
+            e.printStackTrace();
+          }
+          //当前时间
+          long now = System.currentTimeMillis();
+          //next发送一条数据的时间
+
+          //如果超时了,则中断logminer的查询
+          if(now - OracleSourceTask.nextTime > timeOutMin*60*1000){
+            restartLogminerFlag = true;
+            log.info("监测线程监测到超时...重新开启logminer");
+            //业务逻辑,并休眠等待重启logminer
+            stop();
+          }
+        }
+      }
+    }).start();
+
+  }    
+
+  @Override
+  public List<SourceRecord> poll() throws InterruptedException {
+    //TODO: Create SourceRecord objects that will be sent the kafka cluster. 
+    String sqlX="";
+    try {
+      ArrayList<SourceRecord> records = new ArrayList<>();
+      while(!this.closed && logMinerData.next()){
+        //数据进入的时间
+        nextTime =  System.currentTimeMillis();
+        if (log.isDebugEnabled()) {
+          logRawMinerData();
+        }
+        Long scn=logMinerData.getLong(SCN_FIELD);
+        Long commitScn=logMinerData.getLong(COMMIT_SCN_FIELD);
+        String rowId=logMinerData.getString(ROW_ID_FIELD);
+        boolean contSF = logMinerData.getBoolean(CSF_FIELD);
+        if (skipRecord){
+          if ((scn.equals(streamOffsetCtrl))&&(commitScn.equals(streamOffsetCommitScn))&&(rowId.equals(streamOffsetRowId))&&(!contSF)){
+            skipRecord=false;
+          }
+          log.info("Skipping data with scn :{} Commit Scn :{} Rowid :{}",scn,commitScn,rowId);
+          continue;
+        }
+        //log.info("Data :"+scn+" Commit Scn :"+commitScn);
+
+        ix++;
+
+        //String containerId = logMinerData.getString(SRC_CON_ID_FIELD);
+        //log.info("logminer event from container {}", containerId);
+        String segOwner = logMinerData.getString(SEG_OWNER_FIELD);
+        String segName = logMinerData.getString(TABLE_NAME_FIELD);
+        String sqlRedo = logMinerData.getString(SQL_REDO_FIELD);
+        String operation = logMinerData.getString(OPERATION_FIELD);
+        if (sqlRedo.contains(TEMPORARY_TABLE)) continue;
+        if (operation.equals(OPERATION_DDL) && (logMinerData.getString("INFO").startsWith("INTERNAL DDL"))) continue;
+        while(contSF){
+          logMinerData.next();
+          sqlRedo +=  logMinerData.getString(SQL_REDO_FIELD);
+          contSF = logMinerData.getBoolean(CSF_FIELD);
+        }
+        sqlX=sqlRedo;
+        Timestamp timeStamp=logMinerData.getTimestamp(TIMESTAMP_FIELD);
+
+        Data row = new Data(scn, segOwner, segName, sqlRedo,timeStamp,operation);
+        topic = config.getTopic().equals("") ? (config.getDbNameAlias()+DOT+row.getSegOwner()+DOT+(operation.equals(OPERATION_DDL) ? DDL_TOPIC_POSTFIX : segName)).toUpperCase() : topic;
+        //log.info(String.format("Fetched %s rows from database %s ",ix,config.getDbNameAlias())+" "+row.getTimeStamp()+" "+row.getSegName()+" "+row.getScn()+" "+commitScn);
+        if (ix % 100 == 0) log.info(String.format("Fetched %s rows from database %s ",ix,config.getDbNameAlias())+" "+row.getTimeStamp());
+        dataSchemaStruct = utils.createDataSchema(segOwner, segName, sqlRedo,operation);
+        if (operation.equals(OPERATION_DDL)) row.setSegName(DDL_TOPIC_POSTFIX);
+        /**
+         * Issue 68
+         *
+         * Addition of DML types to target to allow only replication of certain DML operations.
+         */
+        if (
+                config.getDMLTypes() == null
+                || config.getDMLTypes().equals("")
+                || Arrays.asList(config.getDMLTypes().toUpperCase().split(",")).contains(operation)) {
+            records.add(new SourceRecord(sourcePartition(), sourceOffset(scn,commitScn,rowId), topic,  dataSchemaStruct.getDmlRowSchema(), setValueV2(row,dataSchemaStruct)));
+            streamOffsetScn=scn;
+        }
+
+        return records;
+      }
+
+      log.info("Logminer stoppped successfully");       
+    } catch (SQLException e){
+      log.error("SQL error during poll",e );
+    }catch(JSQLParserException e){
+      log.error("SQL parser error during poll ", e);
+    }
+    catch(Exception e){
+      log.error("Error during poll on topic {} SQL :{}", topic, sqlX, e);
+    }
+    return null;
+    
+  }
+
+  //抽出开启logminer的逻辑
+  public void startLogminer(Map<String, String> map){
+    config=new OracleSourceConnectorConfig(map);
+    timeOutMin=config.getTimeOutMin();
+    log.info("定义的超时重启时间为:{}分钟",timeOutMin);
     topic=config.getTopic();
     dbName=config.getDbNameAlias();
     parseDmlData=config.getParseDmlData();
     String startSCN = config.getStartScn();
     log.info("Oracle Kafka Connector is starting on {}",config.getDbNameAlias());
-    try {      
+    try {
       dbConn = new OracleConnection().connect(config);
       utils = new OracleSourceConnectorUtils(dbConn, config);
       int dbVersion = utils.getDbVersion();
@@ -134,20 +250,20 @@ public class OracleSourceTask extends SourceTask {
       if (offset!=null){
         Object lastRecordedOffset = offset.get(POSITION_FIELD);
         Object commitScnPositionObject = offset.get(COMMITSCN_POSITION_FIELD);
-        Object rowIdPositionObject = offset.get(ROWID_POSITION_FIELD);        
+        Object rowIdPositionObject = offset.get(ROWID_POSITION_FIELD);
         streamOffsetScn = (lastRecordedOffset != null) ? Long.parseLong(String.valueOf(lastRecordedOffset)) : 0L;
         streamOffsetCommitScn = (commitScnPositionObject != null) ? Long.parseLong(String.valueOf(commitScnPositionObject)) : 0L;
         streamOffsetRowId = (rowIdPositionObject != null) ? (String) offset.get(ROWID_POSITION_FIELD) : "";
         if (oraDeSupportCM) streamOffsetScn = streamOffsetCommitScn;
-        log.info("Offset values , scn:{},commitscn:{},rowid:{}",streamOffsetScn,streamOffsetCommitScn,streamOffsetRowId);        
-      }      
+        log.info("Offset values , scn:{},commitscn:{},rowid:{}",streamOffsetScn,streamOffsetCommitScn,streamOffsetRowId);
+      }
 
       if (streamOffsetScn!=0L){
         if (!oraDeSupportCM){
           streamOffsetCtrl=streamOffsetScn;
           PreparedStatement lastScnFirstPosPs=dbConn.prepareCall(OracleConnectorSQL.LASTSCN_STARTPOS);
           lastScnFirstPosPs.setLong(1, streamOffsetScn);
-          lastScnFirstPosPs.setLong(2, streamOffsetScn);        
+          lastScnFirstPosPs.setLong(2, streamOffsetScn);
           ResultSet lastScnFirstPosRSet=lastScnFirstPosPs.executeQuery();
           while(lastScnFirstPosRSet.next()){
             streamOffsetScn= lastScnFirstPosRSet.getLong("FIRST_CHANGE#");
@@ -157,19 +273,19 @@ public class OracleSourceTask extends SourceTask {
           log.info("Captured last SCN has first position:{}",streamOffsetScn);
         }
       }
-      
+
       if (!startSCN.equals("")){
         log.info("Resetting offset with specified start SCN:{}",startSCN);
         streamOffsetScn=Long.parseLong(startSCN);
         //streamOffsetScn-=1;
         skipRecord=false;
       }
-      
+
       if (config.getResetOffset()){
         log.info("Resetting offset with new SCN");
         streamOffsetScn=0L;
         streamOffsetCommitScn=0L;
-        streamOffsetRowId="";        
+        streamOffsetRowId="";
       }
 
       if (streamOffsetScn==0L){
@@ -180,125 +296,48 @@ public class OracleSourceTask extends SourceTask {
           streamOffsetScn=currentScnResultSet.getLong("CURRENT_SCN");
         }
         currentScnResultSet.close();
-        currentSCNStmt.close();        
+        currentSCNStmt.close();
         log.info("Getting current scn from database {}",streamOffsetScn);
       }
       //streamOffsetScn+=1;
       log.info("Commit SCN : "+streamOffsetCommitScn);
       log.info(String.format("Log Miner will start at new position SCN : %s with fetch size : %s", streamOffsetScn,config.getDbFetchSize()));
-      if (!oraDeSupportCM){
+
       logMinerStartStmt.setLong(1, streamOffsetScn);
-      logMinerStartStmt.execute();      
+      logMinerStartStmt.execute();
       logMinerSelect=dbConn.prepareCall(logMinerSelectSql);
       logMinerSelect.setFetchSize(config.getDbFetchSize());
       logMinerSelect.setLong(1, streamOffsetCommitScn);
       logMinerData=logMinerSelect.executeQuery();
       log.info("Logminer started successfully");
-      }else{
-        //tLogMiner = new Thread(new LogMinerThread(sourceRecordMq,dbConn,streamOffsetScn, logMinerStartStmt,logMinerSelectSql,config.getDbFetchSize(),topic,dbName,utils));        
-        tLogMiner = new LogMinerThread(sourceRecordMq,dbConn,streamOffsetScn, logMinerStartStmt,logMinerSelectSql,config.getDbFetchSize(),topic,dbName,utils);
-        //tLogMiner.start();
-        executor.submit(tLogMiner);
-        
-        Runtime.getRuntime().addShutdownHook(new Thread(){
-          @Override
-          public void run(){
-            tLogMiner.shutDown();
-            executor.shutdown();
-            try {              
-              log.info("Waiting for logminer thread to shut down,exiting cleanly");
-              if (executor.awaitTermination(20000, TimeUnit.MILLISECONDS)) {                
-              }
-            } catch (Exception e) {
-              log.error(e.getMessage());
-            }
-          }
-        });
-      }
+
     }catch(SQLException e){
       throw new ConnectException("Error at database tier, Please check : "+e.toString());
     }
-  }    
+  }
 
-  @Override
-  public List<SourceRecord> poll() throws InterruptedException {
-    //TODO: Create SourceRecord objects that will be sent the kafka cluster. 
-    String sqlX="";
+  /**
+   * 重启logminer
+   */
+  public void restart(){
+    log.info("Stop called for logminer");
+    this.closed=true;
     try {
-      ArrayList<SourceRecord> records = new ArrayList<>();
-      if (!oraDeSupportCM){
-        while(!this.closed && logMinerData.next()){
-          if (log.isDebugEnabled()) {
-            logRawMinerData();
-          }
-          Long scn=logMinerData.getLong(SCN_FIELD);
-          Long commitScn=logMinerData.getLong(COMMIT_SCN_FIELD);
-          String rowId=logMinerData.getString(ROW_ID_FIELD);
-          boolean contSF = logMinerData.getBoolean(CSF_FIELD);
-          if (skipRecord){
-            if ((scn.equals(streamOffsetCtrl))&&(commitScn.equals(streamOffsetCommitScn))&&(rowId.equals(streamOffsetRowId))&&(!contSF)){
-              skipRecord=false;
-            }
-            log.info("Skipping data with scn :{} Commit Scn :{} Rowid :{}",scn,commitScn,rowId);
-            continue;
-          }
-          //log.info("Data :"+scn+" Commit Scn :"+commitScn);
+      logMinerSelect.cancel();
+      OracleSqlUtils.executeCallableStmt(dbConn, OracleConnectorSQL.STOP_LOGMINER_CMD);
+      logMinerSelect.close();
+      logMinerStartStmt.close();
+      //重新开启logminer
+      log.info("重新启动logminer中...");
+      startLogminer(configMap);
 
-          ix++;
-      
-          //String containerId = logMinerData.getString(SRC_CON_ID_FIELD);
-          //log.info("logminer event from container {}", containerId);
-          String segOwner = logMinerData.getString(SEG_OWNER_FIELD); 
-          String segName = logMinerData.getString(TABLE_NAME_FIELD);
-          String sqlRedo = logMinerData.getString(SQL_REDO_FIELD);
-          String operation = logMinerData.getString(OPERATION_FIELD);
-          if (sqlRedo.contains(TEMPORARY_TABLE)) continue;
-          if (operation.equals(OPERATION_DDL) && (logMinerData.getString("INFO").startsWith("INTERNAL DDL"))) continue;
-          while(contSF){
-            logMinerData.next();
-            sqlRedo +=  logMinerData.getString(SQL_REDO_FIELD);
-            contSF = logMinerData.getBoolean(CSF_FIELD);
-          } 
-          sqlX=sqlRedo;        
-          Timestamp timeStamp=logMinerData.getTimestamp(TIMESTAMP_FIELD);
+      restartLogminerFlag=false;
+      this.closed=false;
 
-          Data row = new Data(scn, segOwner, segName, sqlRedo,timeStamp,operation);
-          topic = config.getTopic().equals("") ? (config.getDbNameAlias()+DOT+row.getSegOwner()+DOT+(operation.equals(OPERATION_DDL) ? DDL_TOPIC_POSTFIX : segName)).toUpperCase() : topic;
-          //log.info(String.format("Fetched %s rows from database %s ",ix,config.getDbNameAlias())+" "+row.getTimeStamp()+" "+row.getSegName()+" "+row.getScn()+" "+commitScn);
-          if (ix % 100 == 0) log.info(String.format("Fetched %s rows from database %s ",ix,config.getDbNameAlias())+" "+row.getTimeStamp());
-          dataSchemaStruct = utils.createDataSchema(segOwner, segName, sqlRedo,operation); 
-          if (operation.equals(OPERATION_DDL)) row.setSegName(DDL_TOPIC_POSTFIX);     
-          /**
-           * Issue 68
-           * 
-           * Addition of DML types to target to allow only replication of certain DML operations.
-           */
-          if (
-        		  config.getDMLTypes() == null 
-        		  || config.getDMLTypes().equals("") 
-        		  || Arrays.asList(config.getDMLTypes().toUpperCase().split(",")).contains(operation)) {
-        	  records.add(new SourceRecord(sourcePartition(), sourceOffset(scn,commitScn,rowId), topic,  dataSchemaStruct.getDmlRowSchema(), setValueV2(row,dataSchemaStruct)));
-        	  streamOffsetScn=scn;        	  
-          }                          
-
-          return records;
-        }
-      }else{
-        
-        records.add(sourceRecordMq.take());
-        return records;
-      }      
-      log.info("Logminer stoppped successfully");       
-    } catch (SQLException e){
-      log.error("SQL error during poll",e );
-    }catch(JSQLParserException e){
-      log.error("SQL parser error during poll ", e);
+    } catch (SQLException e) {
+      e.printStackTrace();
     }
-    catch(Exception e){
-      log.error("Error during poll on topic {} SQL :{}", topic, sqlX, e);
-    }
-    return null;
-    
+
   }
 
   @Override

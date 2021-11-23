@@ -64,7 +64,7 @@ public class OracleSourceTask extends SourceTask {
   private static Connection dbConn;
   String logMinerOptions=OracleConnectorSQL.LOGMINER_START_OPTIONS;
   String logMinerOptionsDeSupportCM=OracleConnectorSQL.LOGMINER_START_OPTIONS_DESUPPORT_CM;
-  String logMinerStartScr=OracleConnectorSQL.START_LOGMINER_CMD;
+  String logMinerStartScr=OracleConnectorSQL.START_LOGMINER_CMD+logMinerOptions+") \n; end;";
   CallableStatement logMinerStartStmt=null;
   CallableStatement logMinerStopStmt = null;
   String logMinerSelectSql;
@@ -112,26 +112,19 @@ public class OracleSourceTask extends SourceTask {
       public void run() {
         while (true){
           try {
-            if(restartLogminerFlag){//如果重启则等待3m后再开始监测
-              log.info("监测线程等待3m重新开启logminer视图");
-              restart();
-              Thread.sleep(3*1000);
-            }
             //每1m 监测一次
-            Thread.sleep(1000);
+            Thread.sleep(60*1000);
           } catch (InterruptedException e) {
             e.printStackTrace();
           }
           //当前时间
           long now = System.currentTimeMillis();
-          //next发送一条数据的时间
-
           //如果超时了,则中断logminer的查询
           if(now - OracleSourceTask.nextTime > timeOutMin*60*1000){
-            restartLogminerFlag = true;
+            OracleSourceTask.nextTime = System.currentTimeMillis();
             log.info("监测线程监测到超时...重新开启logminer");
             //业务逻辑,并休眠等待重启logminer
-            stop();
+            restart();
           }
         }
       }
@@ -146,12 +139,14 @@ public class OracleSourceTask extends SourceTask {
     try {
       ArrayList<SourceRecord> records = new ArrayList<>();
       while(!this.closed && logMinerData.next()){
+
         //数据进入的时间
         nextTime =  System.currentTimeMillis();
         if (log.isDebugEnabled()) {
           logRawMinerData();
         }
         Long scn=logMinerData.getLong(SCN_FIELD);
+        log.info("发送到kafka,scn:{}",scn);
         Long commitScn=logMinerData.getLong(COMMIT_SCN_FIELD);
         String rowId=logMinerData.getString(ROW_ID_FIELD);
         boolean contSF = logMinerData.getBoolean(CSF_FIELD);
@@ -203,7 +198,7 @@ public class OracleSourceTask extends SourceTask {
 
         return records;
       }
-
+      Thread.sleep(10*1000);
       log.info("Logminer stoppped successfully");       
     } catch (SQLException e){
       log.error("SQL error during poll",e );
@@ -240,7 +235,8 @@ public class OracleSourceTask extends SourceTask {
         oraDeSupportCM=true;
         logMinerSelectSql = utils.getLogMinerSelectSqlDeSupportCM();
       }
-      logMinerStartScr=logMinerStartScr+(oraDeSupportCM ? logMinerOptionsDeSupportCM : logMinerOptions)+") \n; end;";
+      //logMinerStartScr=logMinerStartScr+logMinerOptions+") \n; end;";
+      //logMinerStartScr=logMinerStartScr+(oraDeSupportCM ? logMinerOptionsDeSupportCM : logMinerOptions)+") \n; end;";
       //logMinerStartScr=logMinerStartScr+logMinerOptions+") \n; end;";
       logMinerStartStmt=dbConn.prepareCall(logMinerStartScr);
       Map<String,Object> offset = context.offsetStorageReader().offset(Collections.singletonMap(LOG_MINER_OFFSET_FIELD, dbName));
@@ -305,6 +301,7 @@ public class OracleSourceTask extends SourceTask {
 
       logMinerStartStmt.setLong(1, streamOffsetScn);
       logMinerStartStmt.execute();
+      log.info("logMinerStartStmt:execute");
       logMinerSelect=dbConn.prepareCall(logMinerSelectSql);
       logMinerSelect.setFetchSize(config.getDbFetchSize());
       logMinerSelect.setLong(1, streamOffsetCommitScn);
@@ -320,24 +317,25 @@ public class OracleSourceTask extends SourceTask {
    * 重启logminer
    */
   public void restart(){
-    log.info("Stop called for logminer");
+    log.warn("Stop called for logminer");
     this.closed=true;
     try {
       logMinerSelect.cancel();
       OracleSqlUtils.executeCallableStmt(dbConn, OracleConnectorSQL.STOP_LOGMINER_CMD);
+      //等待10s
+      Thread.sleep(10*1000);
       logMinerSelect.close();
       logMinerStartStmt.close();
+      logMinerData.close();
+      dbConn.close();
       //重新开启logminer
-      log.info("重新启动logminer中...");
+      log.warn("重新启动logminer中...");
       startLogminer(configMap);
-
-      restartLogminerFlag=false;
       this.closed=false;
 
-    } catch (SQLException e) {
+    } catch (SQLException | InterruptedException e) {
       e.printStackTrace();
     }
-
   }
 
   @Override
